@@ -103,11 +103,19 @@ STAMP = BUILD / "MAYA-BUILD.json"                  # what the engine in build/ w
 VBUILD = ROOT / "build-vision"
 VEXE = VBUILD / "bin" / ("maya-vision.exe" if WIN else "maya-vision")  # the image encoder (llama.cpp's mtmd)
 VSTAMP = VBUILD / "MAYA-BUILD.json"
+MINGW = os.environ.get("MAYA_HIP_MINGW") == "1"    # opt-in: the HIP engine with ROCm's clang targeting MSYS2's
+                                                   # UCRT64 ABI - no Visual Studio Build Tools (tools/hip/mingw/)
+MINGW_ROOT = Path(r"C:\msys64\ucrt64")             # its headers, libgcc and the runtime DLLs
+MINGW_GCC = "16.2.0"                               # its gcc's C++ headers (the newest include/c++ wins)
+MINGW_MODULES = ROOT / "tools" / "hip" / "mingw" / "modules"   # the Windows-GNU HIP ABI module CMake lacks
+MINGW_DLLS = ("libstdc++-6.dll", "libgcc_s_seh-1.dll", "libwinpthread-1.dll")   # beside maya.exe
 MIN_CC = 60                                        # Pascal and newer (the GLM path; see arch_setting) ...
 VALIDATED_CC = 70                                  # ... Volta (V100) and newer validated, Pascal experimental (#212)
 SMALL_GPU_SHARE = 0.25                             # choose_gpus: a card under this share of the biggest one's VRAM is left out
 MAX_GPUS = 16                                     # the layer split's parts at most (glm_model.hpp, kMaxParts)
-HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix Halo (unified memory)
+HIP_ARCHS = ("gfx1100", "gfx1101", "gfx1201", "gfx1151")   # Maya also supports Strix Halo (unified memory);
+                                                   # gfx1101 (RX 7700 / 7800 XT, Navi 32) is a LOCAL addition:
+                                                   # RDNA 3 like gfx1100, but not in Maya's test matrix
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
                                                    # validated on a card; no matrix cores, the portable kernels; compiled
                                                    # only when such a GPU is chosen
@@ -1209,12 +1217,21 @@ def vs_2026(vcvars) -> bool:
 def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's HIP backend runs on native Linux or Windows")
-    vcvars = S.find_vcvars(cuda=False) if WIN else None
-    if WIN and vcvars is None:      # (before ROCm's download: ROCm's clang needs its headers)
+    vcvars = S.find_vcvars(cuda=False) if WIN and not MINGW else None
+    if WIN and MINGW:
+        # MAYA_HIP_MINGW=1: ROCm's clang builds for MSYS2's UCRT64 ABI, so there is no Visual Studio environment
+        if not (MINGW_ROOT / "include" / "c++" / mingw_gcc()[1]).is_dir():
+            fail(f"MSYS2 UCRT64 was not found at {MINGW_ROOT} (MAYA_HIP_MINGW=1)",
+                 "install MSYS2 (https://www.msys2.org), then its UCRT64 gcc: pacman -S "
+                 "mingw-w64-ucrt-x86_64-gcc - the setup builds the HIP engine with that ABI instead of Visual Studio")
+        ok(f"MinGW mode (MAYA_HIP_MINGW=1): ROCm's clang with MSYS2 UCRT64's headers and libraries ({MINGW_ROOT}); "
+           "Visual Studio is not needed")
+    if WIN and not MINGW and vcvars is None:      # (before ROCm's download: ROCm's clang needs its headers)
         fail("Visual Studio Build Tools (2022 or 2026) are needed: ROCm's compiler uses their headers and libraries",
              "winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override \"--wait --passive --add "
              "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\" - or "
-             "https://visualstudio.microsoft.com/visual-cpp-build-tools/ with 'Desktop development with C++'")
+             "https://visualstudio.microsoft.com/visual-cpp-build-tools/ with 'Desktop development with C++' - or "
+             "set MAYA_HIP_MINGW=1 to build with MSYS2's UCRT64 toolchain instead")
     if vs_2026(vcvars):
         warn("only Visual Studio 2026's Build Tools were found - " + VS2026_HIP_HINT)
     root, bindir = windows_rocm() if WIN else (None, None)
@@ -1226,7 +1243,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not usable:
         fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9070 / AI PRO R9700 "
              "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151); experimental, not "
-             "validated: RX 6800 / 6900, Radeon PRO V620 / W6800 (gfx1030)")
+             "validated: RX 6800 / 6900, Radeon PRO V620 / W6800 (gfx1030), RX 7700 / 7800 XT (gfx1101)")
     if WIN and hipinfo and all(g.get("source") == "registry" for g in found):
         warn(f"ROCm's hipInfo sees no AMD GPU (the list above is Windows'): the engine cannot start until it does - "
              f"update AMD's driver (AMD Software: Adrenalin Edition, https://www.amd.com/en/support), restart, and "
@@ -1340,6 +1357,10 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         warn(f"{', '.join(unvalidated)} (RDNA 2) is experimental: it builds and has the portable kernels, but Maya has "
              "not been validated on such a card yet - please report how it goes in an issue "
              "(https://github.com/mw00/project-maya/issues)")
+    if any(g["arch"] == "gfx1101" for g in chosen):
+        warn("gfx1101 (RX 7700 / 7800 XT, Navi 32) is a local addition to Maya's GPU list, not validated upstream: "
+             "the source has __gfx1101__ guards, but no hipBLASLt tuning table exists for it (plain hipBLAS is used) "
+             "and answers are unverified on this card")
     select_build_backend("hip")
     return {"backend": "hip", "gpus": chosen, "archs": sorted({g["arch"] for g in chosen}), "rocm": str(root),
             **({"rocm_bin": str(bindir)} if WIN else {})}
@@ -2322,12 +2343,16 @@ def vs_env(env=None) -> dict:
     return env
 
 
-def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str | None:
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None, mingw=False) -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
     compiler's environment - the way Strata's setup.py builds there (cmake_build).  `nvcc` says which toolkit the
-    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars)."""
-    if not WIN:
+    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars).  `mingw`
+    (MAYA_HIP_MINGW=1) runs the commands as they are: ROCm's clang for the MSYS2 ABI needs no Visual Studio."""
+    if not WIN or mingw:
+        if mingw:
+            say("  > " + cmdline(conf))
+            say("  > " + cmdline(build))
         if run(conf, env=env, check=False).returncode != 0:
             return "configuring"
         if run(build, env=env, check=False).returncode != 0:
@@ -2403,6 +2428,31 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     return (nvccs[0] if nvccs else nvcc_given), hc_given
 
 
+def mingw_gcc() -> tuple:
+    """(MSYS2 UCRT64's root, its gcc's version) for MAYA_HIP_MINGW=1: C:\\msys64\\ucrt64, the newest include/c++
+    (16.2.0 when the folder names none)."""
+    vers = [p.name for p in (MINGW_ROOT / "include" / "c++").glob("[0-9]*")
+            if (p / "x86_64-w64-mingw32").is_dir()]
+    if not vers:
+        return MINGW_ROOT, MINGW_GCC
+    return MINGW_ROOT, max(vers, key=lambda v: [int(x) for x in re.findall(r"\d+", v)])
+
+
+def mingw_flags(root: Path, bitcode: Path) -> tuple:
+    """(C/C++, HIP) compiler flags for ROCm's clang targeting MSYS2's UCRT64 ABI (MAYA_HIP_MINGW=1), as
+    tools/hip/mingw/configure.ps1 proved them: ROCm's headers, MSYS2's C++ headers and libraries, and for HIP its
+    device libraries."""
+    ucrt, gcc = mingw_gcc()
+    cxx = ucrt / "include" / "c++" / gcc
+    flags = " ".join(["--target=x86_64-w64-windows-gnu", "-fdeclspec",
+                      f"-isystem {(root / 'include').as_posix()}", f"-isystem {cxx.as_posix()}",
+                      f"-isystem {(cxx / 'x86_64-w64-mingw32').as_posix()}",
+                      f"-isystem {(ucrt / 'include').as_posix()}",
+                      f"-L {(ucrt / 'lib').as_posix()}",
+                      f"-L {(ucrt / 'lib' / 'gcc' / 'x86_64-w64-mingw32' / gcc).as_posix()}"])
+    return flags, f"{flags} --rocm-path={root.as_posix()} --rocm-device-lib-path={bitcode.as_posix()}"
+
+
 def hip_toolchain(pc: dict) -> tuple:
     """(ROCm root, its clang++, its bin folder, the build's environment) for a HIP build - the engine's and, on
     Windows, the vision encoder's (#345)."""
@@ -2435,12 +2485,21 @@ def copy_hip_dlls(bindir: Path, dest: Path) -> None:
     # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
     # runtime - and PATH only after: the runtime the program was built with goes next to it (as llama.cpp's
     # Windows builds do; with the driver's, cudaMemGetInfo failed there)
-    for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
-        for dll in bindir.glob(pattern):
-            try:
-                shutil.copy2(dll, dest)
-            except OSError as e:                   # (in use: a program still running keeps the one it has)
-                warn(f"could not copy {dll.name} next to {dest} ({e})")
+    sources = [(bindir, ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"))]
+    if MINGW:                                    # (ROCm's clang has no C++ runtime: MSYS2's goes along)
+        sources.append((MINGW_ROOT / "bin", MINGW_DLLS))
+    for folder, patterns in sources:
+        for pattern in patterns:
+            for dll in folder.glob(pattern):
+                try:
+                    shutil.copy2(dll, dest)
+                except OSError as e:                   # (in use: a program still running keeps the one it has)
+                    warn(f"could not copy {dll.name} next to {dest} ({e})")
+    if MINGW:
+        missing = [n for n in MINGW_DLLS if not (dest / n).is_file()]
+        if missing:
+            warn(f"the MinGW runtime is incomplete next to {dest}: {', '.join(missing)} - stage it with "
+                 f"{sys.executable} tools\\hip\\mingw\\stage_runtime.py")
 
 
 def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
@@ -2456,12 +2515,24 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         if not ninja:
             fail("Ninja is needed to compile the HIP engine on Windows", f"run {ME} --setup again (pip puts it into .venv)")
         bitcode = Path(env["HIP_DEVICE_LIB_PATH"])
-        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
-                 f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
-                 f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
-                 "-DSTRATA_PORTABLE=ON"]
-        if " " not in str(root) + str(bitcode):        # (with a space in them, clang takes HIP_PATH and the above)
-            conf.append(f"-DCMAKE_HIP_FLAGS=--rocm-path={root.as_posix()} --rocm-device-lib-path={bitcode.as_posix()}")
+        if MINGW:
+            # MAYA_HIP_MINGW=1: ROCm's clang for the MinGW (UCRT64) ABI - MSYS2's headers and libraries, no Visual
+            # Studio; the flags and the module are tools/hip/mingw/configure.ps1's
+            cflags, hipflags = mingw_flags(root, bitcode)
+            conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
+                     f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
+                     f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
+                     f"-DCMAKE_MODULE_PATH={MINGW_MODULES.as_posix()}", "-DCMAKE_LINKER=lld",
+                     f"-DCMAKE_C_FLAGS={cflags}", f"-DCMAKE_CXX_FLAGS={cflags}", f"-DCMAKE_HIP_FLAGS={hipflags}",
+                     # (MSVC-only #pragma comment(lib)s in src/ds4 and src/mm3: MinGW ignores them, so here they are)
+                     "-DCMAKE_EXE_LINKER_FLAGS=-lwinmm -lpsapi", "-DSTRATA_PORTABLE=ON"]
+        else:
+            conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
+                     f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
+                     f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
+                     "-DSTRATA_PORTABLE=ON"]
+            if " " not in str(root) + str(bitcode):        # (with a space in them, clang takes HIP_PATH and the above)
+                conf.append(f"-DCMAKE_HIP_FLAGS=--rocm-path={root.as_posix()} --rocm-device-lib-path={bitcode.as_posix()}")
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
              "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
@@ -2472,9 +2543,9 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
-    vcvars = S.find_vcvars(cuda=False) if WIN else None
+    vcvars = None if MINGW else (S.find_vcvars(cuda=False) if WIN else None)
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
-                   "build-maya-hip.bat", vcvars=vcvars):
+                   "build-maya-hip.bat", vcvars=vcvars, mingw=bool(WIN and MINGW)):
         if soft:
             # (not the engine compiled before: it is from the older source, and this version's server and config
             #  start it with settings it may not know or silently ignore - #805's start failed that way)
@@ -2482,7 +2553,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
                  "not match this version, so it is not started",
                  "the compiler's reason is above - fix it, then start Maya again (it compiles again)" +
                  ("; build-maya-hip.bat > build-hip.txt 2>&1 runs the same build alone and keeps its output"
-                  if WIN else "") +
+                  if WIN and not MINGW else "") +
                  (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
@@ -3634,7 +3705,13 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
             root, clang, bindir, env = hip_toolchain(pc)
             conf += [f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
                      f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}"]
-            vcvars = S.find_vcvars(cuda=False)
+            if MINGW:                                  # (MAYA_HIP_MINGW=1: the engine's MinGW flags, no Visual Studio)
+                cflags, hipflags = mingw_flags(root, Path(env["HIP_DEVICE_LIB_PATH"]))
+                conf += [f"-DCMAKE_MODULE_PATH={MINGW_MODULES.as_posix()}", "-DCMAKE_LINKER=lld",
+                         f"-DCMAKE_C_FLAGS={cflags}", f"-DCMAKE_CXX_FLAGS={cflags}", f"-DCMAKE_HIP_FLAGS={hipflags}",
+                         "-DCMAKE_EXE_LINKER_FLAGS=-lwinmm -lpsapi"]
+            else:
+                vcvars = S.find_vcvars(cuda=False)
         else:
             conf.append("-DCMAKE_EXE_LINKER_FLAGS=-no-pie")
         if S.ARM and S.arm_cpu_arch():
@@ -3654,7 +3731,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         ", once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
                    dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
-                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
+                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"], mingw=bool(hip and WIN and MINGW)):
         return False
     if bindir is not None and VEXE.exists():
         copy_hip_dlls(bindir, VEXE.parent)
